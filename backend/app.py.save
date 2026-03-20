@@ -1,0 +1,664 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+import re
+import socket
+import concurrent.futures
+import ipaddress
+
+app = Flask(__name__)
+CORS(app)
+
+# Database configuration
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///cybershield.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# ── DATABASE MODELS ────────────────────────────────────────
+
+class QuizResult(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    score = db.Column(db.Integer, nullable=False)
+    total = db.Column(db.Integer, nullable=False)
+    percentage = db.Column(db.Float, nullable=False)
+    date_taken = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "score": self.score,
+            "total": self.total,
+            "percentage": round(self.percentage, 1),
+            "date_taken": self.date_taken.strftime("%d %b %Y, %H:%M")
+        }
+
+class PasswordCheck(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    strength = db.Column(db.String(20), nullable=False)
+    score = db.Column(db.Integer, nullable=False)
+    date_checked = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "strength": self.strength,
+            "score": self.score,
+            "date_checked": self.date_checked.strftime("%d %b %Y, %H:%M")
+        }
+
+class PhishingCheck(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    input_type = db.Column(db.String(10), nullable=False)
+    verdict = db.Column(db.String(20), nullable=False)
+    score = db.Column(db.Integer, nullable=False)
+    date_checked = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "input_type": self.input_type,
+            "verdict": self.verdict,
+            "score": self.score,
+            "date_checked": self.date_checked.strftime("%d %b %Y, %H:%M")
+        }
+
+# Create all tables
+with app.app_context():
+    db.create_all()
+
+# Common weak passwords to block immediately
+COMMON_PASSWORDS = [
+    "password", "123456", "password123", "admin", "letmein",
+    "qwerty", "abc123", "monkey", "1234567890", "iloveyou",
+    "password1", "sunshine", "uganda", "kampala", "welcome"
+]
+
+def check_password(password):
+    score = 0
+    feedback = []
+    strength = ""
+
+    # Check: common password
+    if password.lower() in COMMON_PASSWORDS:
+        return {
+            "score": 0,
+            "strength": "Very Weak",
+            "color": "#e74c3c",
+            "feedback": ["This is one of the most commonly used passwords. Change it immediately!"],
+            "percentage": 5
+        }
+
+    # Check: length
+    if len(password) < 8:
+        feedback.append("Use at least 8 characters.")
+    elif len(password) >= 8:
+        score += 1
+    if len(password) >= 12:
+        score += 1
+    if len(password) >= 16:
+        score += 1
+        feedback.append("Great length!")
+
+    # Check: uppercase
+    if re.search(r'[A-Z]', password):
+        score += 1
+    else:
+        feedback.append("Add at least one uppercase letter (A-Z).")
+
+    # Check: lowercase
+    if re.search(r'[a-z]', password):
+        score += 1
+    else:
+        feedback.append("Add at least one lowercase letter (a-z).")
+
+    # Check: numbers
+    if re.search(r'\d', password):
+        score += 1
+    else:
+        feedback.append("Add at least one number (0-9).")
+
+    # Check: special characters
+    if re.search(r'[!@#$%^&*(),.?\":{}|<>_\-]', password):
+        score += 1
+    else:
+        feedback.append("Add a special character like @, #, $, or !.")
+
+    # Check: no spaces
+    if ' ' in password:
+        feedback.append("Avoid using spaces in your password.")
+        score -= 1
+
+    # Determine strength label
+    if score <= 2:
+        strength = "Weak"
+        color = "#e74c3c"
+        percentage = 25
+    elif score <= 4:
+        strength = "Fair"
+        color = "#f39c12"
+        percentage = 50
+    elif score <= 5:
+        strength = "Good"
+        color = "#f1c40f"
+        percentage = 70
+    else:
+        strength = "Strong"
+        color = "#2ecc71"
+        percentage = 100
+        if not feedback:
+            feedback.append("Excellent password! Keep it safe and never share it.")
+
+    return {
+        "score": score,
+        "strength": strength,
+        "color": color,
+        "feedback": feedback,
+        "percentage": percentage
+    }
+
+@app.route('/api/check-password', methods=['POST'])
+def password_check():
+    data = request.get_json()
+    password = data.get('password', '')
+
+    if not password:
+        return jsonify({"error": "No password provided"}), 400
+
+    result = check_password(password)
+
+    # Save to database (never save the actual password — only the result)
+    record = PasswordCheck(
+        strength=result['strength'],
+        score=result['score']
+    )
+    db.session.add(record)
+    db.session.commit()
+
+    return jsonify(result)
+
+# ── PHISHING DETECTOR ──────────────────────────────────────
+
+PHISHING_KEYWORDS = [
+    "verify your account", "confirm your pin", "your account has been suspended",
+    "click here to claim", "you have won", "urgent action required",
+    "your mtn mobile money", "your airtel money", "send your pin",
+    "enter your pin", "account will be closed", "congratulations you won",
+    "free airtime", "claim your prize", "limited time offer",
+    "your sim will be blocked", "dear customer your", "winner of",
+    "kindly send", "send us your", "verify now", "act now",
+    "your account will be deactivated", "update your details",
+]
+
+SUSPICIOUS_DOMAINS = [
+    "bit.ly", "tinyurl.com", "goo.gl", "ow.ly", "t.co",
+    "rebrand.ly", "cutt.ly", "shorturl.at",
+]
+
+LEGITIMATE_DOMAINS = [
+    "mtn.co.ug", "airtel.co.ug", "google.com", "facebook.com",
+    "youtube.com", "wikipedia.org", "go.ug", "government.go.ug",
+]
+
+def analyze_url(url):
+    score = 0
+    reasons = []
+
+    url_lower = url.lower()
+
+    # Check for HTTPS
+    if not url_lower.startswith("https://"):
+        score += 2
+        reasons.append("Does not use secure HTTPS — be careful.")
+
+    # Check for IP address instead of domain name
+    import re
+    if re.search(r'http[s]?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', url):
+        score += 3
+        reasons.append("Uses a raw IP address instead of a domain name — very suspicious.")
+
+    # Check for suspicious shortener domains
+    for domain in SUSPICIOUS_DOMAINS:
+        if domain in url_lower:
+            score += 2
+            reasons.append(f"Uses a URL shortener ({domain}) — destination is hidden.")
+
+    # Check for legitimate domains
+    for domain in LEGITIMATE_DOMAINS:
+        if domain in url_lower:
+            score -= 2
+            reasons.append(f"Contains a known legitimate domain ({domain}).")
+
+    # Check for multiple subdomains (e.g. mtn.verify.account.ru)
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        parts = hostname.split(".")
+        if len(parts) > 3:
+            score += 2
+            reasons.append("Has too many subdomains — often used to fake legitimate sites.")
+        # Check for brand names in subdomain (e.g. mtn.fakesite.com)
+        brand_names = ["mtn", "airtel", "stanbic", "dfcu", "centenary", "umeme", "nwsc"]
+        for brand in brand_names:
+            if brand in parts[:-2]:
+                score += 3
+                reasons.append(f"Contains '{brand}' in subdomain — could be impersonating a Ugandan brand.")
+    except:
+        pass
+
+    # Check for suspicious words in URL
+    suspicious_url_words = ["login", "verify", "secure", "account", "update", "confirm", "banking", "prize", "winner", "free"]
+    for word in suspicious_url_words:
+        if word in url_lower:
+            score += 1
+            reasons.append(f"URL contains suspicious word: '{word}'.")
+            break
+
+    # Check for very long URL
+    if len(url) > 100:
+        score += 1
+        reasons.append("URL is unusually long — sometimes used to hide the real destination.")
+
+    return score, reasons
+
+def analyze_text(text):
+    score = 0
+    reasons = []
+    text_lower = text.lower()
+
+    for keyword in PHISHING_KEYWORDS:
+        if keyword in text_lower:
+            score += 2
+            reasons.append(f"Contains suspicious phrase: '{keyword}'.")
+
+    # Check for PIN/password requests
+    if re.search(r'\bpin\b|\bpassword\b|\bcode\b', text_lower):
+        score += 3
+        reasons.append("Asks for your PIN, password, or code — legitimate companies NEVER ask for this.")
+
+    # Check for urgency language
+    urgency_words = ["immediately", "urgent", "right now", "expires", "24 hours", "blocked", "suspended"]
+    for word in urgency_words:
+        if word in text_lower:
+            score += 1
+            reasons.append(f"Uses urgency language ('{word}') to pressure you.")
+            break
+
+    # Check for money amounts
+    if re.search(r'(ugx|ush|shs)\s?\d+|\d+\s?(ugx|ush|shs)', text_lower):
+        score += 1
+        reasons.append("Contains a money amount — verify this is from a trusted source.")
+
+    # Check for phone numbers
+    if re.search(r'(\+?256|0)[37]\d{8}', text):
+        score += 1
+        reasons.append("Contains a phone number — do not call or send money to unknown numbers.")
+
+    return score, reasons
+
+@app.route('/api/check-phishing', methods=['POST'])
+def phishing_check():
+    data = request.get_json()
+    input_type = data.get('type', 'url')
+    content = data.get('content', '').strip()
+
+    if not content:
+        return jsonify({"error": "No content provided"}), 400
+
+    if input_type == 'url':
+        score, reasons = analyze_url(content)
+    else:
+        score, reasons = analyze_text(content)
+
+    if score <= 0:
+        verdict = "Likely Safe"
+        color = "#2ecc71"
+        percentage = 5
+        advice = "This looks safe, but always stay alert online."
+    elif score <= 3:
+        verdict = "Suspicious"
+        color = "#f39c12"
+        percentage = 50
+        advice = "Proceed with caution. Do not enter personal details."
+    elif score <= 6:
+        verdict = "Likely Phishing"
+        color = "#e67e22"
+        percentage = 75
+        advice = "This looks like a phishing attempt. Do not click or respond."
+    else:
+        verdict = "Dangerous"
+        color = "#e74c3c"
+        percentage = 100
+        advice = "DANGER! This is almost certainly a scam. Block and report immediately."
+
+    # Save to database
+    record = PhishingCheck(
+        input_type=input_type,
+        verdict=verdict,
+        score=score
+    )
+    db.session.add(record)
+    db.session.commit()
+
+    return jsonify({
+        "verdict": verdict,
+        "color": color,
+        "percentage": percentage,
+        "score": score,
+        "reasons": reasons,
+        "advice": advice
+    })
+# ── CYBER AWARENESS HUB ────────────────────────────────────
+
+TIPS = [
+    {"id": 1, "title": "Protect your Mobile Money PIN", "category": "Mobile Money", "tip": "Never share your MTN or Airtel Mobile Money PIN with anyone — not even someone claiming to be a customer care agent. Legitimate agents will NEVER ask for your PIN.", "icon": "📱"},
+    {"id": 2, "title": "Use strong passwords", "category": "Passwords", "tip": "Use a different password for every account. A strong password has at least 12 characters, with uppercase, lowercase, numbers and symbols. Use our Password Checker tool to test yours!", "icon": "🔐"},
+    {"id": 3, "title": "Beware of fake job offers", "category": "Scams", "tip": "If a job offer asks you to pay money before you start working, it is a scam. Legitimate employers in Uganda do not ask job seekers to pay registration or processing fees.", "icon": "💼"},
+    {"id": 4, "title": "Check links before clicking", "category": "Phishing", "tip": "Before clicking any link sent via WhatsApp, SMS or email, check the URL carefully. Fake sites often use names like 'mtn-verify.com' instead of the real 'mtn.co.ug'.", "icon": "🔗"},
+    {"id": 5, "title": "Lock your phone screen", "category": "Device Security", "tip": "Always set a PIN, pattern or fingerprint lock on your phone. If your phone is stolen without a lock, the thief can access your Mobile Money and social media accounts instantly.", "icon": "📵"},
+    {"id": 6, "title": "Be careful on public WiFi", "category": "Network", "tip": "Avoid accessing your bank account or Mobile Money on public WiFi in places like cafes or bus parks. Hackers can intercept your data on unsecured networks.", "icon": "📶"},
+    {"id": 7, "title": "Update your apps regularly", "category": "Device Security", "tip": "Keep your phone apps and operating system updated. Updates fix security holes that hackers use to break into your device.", "icon": "🔄"},
+    {"id": 8, "title": "Watch out for SIM swap fraud", "category": "Mobile Money", "tip": "SIM swap fraud is common in Uganda. If your phone suddenly loses network for no reason, contact your telecom immediately — someone may be trying to steal your number to access your Mobile Money.", "icon": "⚠️"},
+{"id": 9,  "title": "Understand open ports on your device", "category": "Network Security", "tip": "An open port is like an open door on your computer. Every unnecessary open port is a potential entry point for attackers. Use our Port Scanner to check which ports are open on your machine.", "icon": "🌐"},
+    {"id": 10, "title": "Close ports you do not need", "category": "Network Security", "tip": "If the Port Scanner finds services like Telnet (port 23), RDP (port 3389) or MongoDB (port 27017) open and you are not using them, disable those services immediately.", "icon": "🔒"},
+    {"id": 11, "title": "Never expose your database to the internet", "category": "Network Security", "tip": "Ports like 3306 (MySQL), 5432 (PostgreSQL) and 27017 (MongoDB) should NEVER be open to the public internet. Many Ugandan businesses have been hacked because of exposed databases.", "icon": "🗄️"},
+    {"id": 12, "title": "SSH is safer than Telnet", "category": "Network Security", "tip": "If you need remote access to a server, always use SSH (port 22) instead of Telnet (port 23). Telnet sends everything including passwords in plain text that anyone on the network can read.", "icon": "💻"},
+]
+
+QUIZ_QUESTIONS = [
+    {
+        "id": 1,
+        "question": "You receive an SMS saying 'Your MTN Mobile Money account will be suspended. Reply with your PIN to verify.' What should you do?",
+        "options": ["Reply with your PIN immediately", "Ignore and delete the message", "Call the number in the message", "Forward it to your friends"],
+        "correct": 1,
+        "explanation": "This is a classic phishing scam. MTN will NEVER ask for your PIN via SMS. Always ignore and delete such messages."
+    },
+    {
+        "id": 2,
+        "question": "Which of these is the strongest password?",
+        "options": ["uganda2024", "John@Kampala", "Tr#9mK!vPx2L", "password123"],
+        "correct": 2,
+        "explanation": "Tr#9mK!vPx2L is strongest because it has 12+ characters, uppercase, lowercase, numbers and symbols with no recognisable words."
+    },
+    {
+        "id": 3,
+        "question": "You get a WhatsApp message: 'Congratulations! You have won UGX 5,000,000. Send UGX 50,000 to claim your prize.' This is most likely:",
+        "options": ["A genuine lottery win", "A government promotion", "An advance fee scam", "A bank promotion"],
+        "correct": 2,
+        "explanation": "This is an advance fee scam — one of the most common in Uganda. You will send the money and never receive any prize. Never pay to claim a prize."
+    },
+    {
+        "id": 4,
+        "question": "What does HTTPS at the beginning of a website address mean?",
+        "options": ["The website is fast", "The website is popular", "The connection is encrypted and more secure", "The website is government-owned"],
+        "correct": 2,
+        "explanation": "HTTPS means the connection between your browser and the website is encrypted, making it harder for hackers to steal your data."
+    },
+    {
+        "id": 5,
+        "question": "Your phone suddenly has no network signal for several hours. What could this mean?",
+        "options": ["Your battery is low", "Someone may have done a SIM swap on your number", "The weather is bad", "Your data bundle expired"],
+        "correct": 1,
+        "explanation": "Sudden loss of network can be a sign of SIM swap fraud — where a criminal transfers your number to a new SIM to access your Mobile Money. Contact your telecom immediately."
+    },
+    {
+        "id": 6,
+        "question": "A new job advert asks you to deposit UGX 30,000 as a 'registration fee' before your interview. What should you do?",
+        "options": ["Pay immediately to secure the job", "Negotiate a lower fee", "Refuse — this is a scam", "Ask a friend to pay for you"],
+        "correct": 2,
+        "explanation": "Legitimate employers never ask for money from job seekers. This is a very common job scam in Uganda targeting young people."
+    },
+{
+        "id": 7,
+        "question": "You run a port scan and find port 23 (Telnet) is open on your server. What should you do?",
+        "options": ["Leave it open — it is useful", "Close it and use SSH instead", "It is fine as long as you have a password", "Open more ports for better access"],
+        "correct": 1,
+        "explanation": "Telnet is extremely insecure — it sends all data including passwords in plain text. You should always close port 23 and use SSH (port 22) instead for secure remote access."
+    },
+    {
+        "id": 8,
+        "question": "Which of these ports being open on a personal laptop is most dangerous?",
+        "options": ["Port 80 (HTTP)", "Port 443 (HTTPS)", "Port 3306 (MySQL)", "Port 22 (SSH)"],
+        "correct": 2,
+        "explanation": "Port 3306 (MySQL) being open means your database is exposed. Attackers can attempt to connect directly to your database and steal or delete all your data. Always keep database ports closed to the public."
+    },
+    {
+        "id": 9,
+        "question": "What is a port in computer networking?",
+        "options": ["A physical socket on your computer", "A numbered channel used by services to send and receive data", "The speed of your internet connection", "A type of network cable"],
+        "correct": 1,
+        "explanation": "A port is a numbered communication channel (0-65535) that allows different services to run on the same computer. For example, web traffic uses port 80, secure web uses 443, and SSH uses port 22."
+    },
+
+]
+
+@app.route('/api/tips', methods=['GET'])
+def get_tips():
+    category = request.args.get('category', None)
+    if category and category != 'All':
+        filtered = [t for t in TIPS if t['category'] == category]
+        return jsonify(filtered)
+    return jsonify(TIPS)
+
+@app.route('/api/quiz', methods=['GET'])
+def get_quiz():
+    return jsonify(QUIZ_QUESTIONS)
+
+@app.route('/api/quiz/check', methods=['POST'])
+def check_quiz():
+    data = request.get_json()
+    question_id = data.get('question_id')
+    selected = data.get('selected')
+    is_final = data.get('is_final', False)
+    final_score = data.get('final_score', None)
+    total_questions = data.get('total_questions', None)
+
+    question = next((q for q in QUIZ_QUESTIONS if q['id'] == question_id), None)
+    if not question:
+        return jsonify({"error": "Question not found"}), 404
+
+    correct = question['correct'] == selected
+
+
+    # Save final score to database when quiz is complete
+    if is_final and final_score is not None and total_questions is not None:
+        percentage = (final_score / total_questions) * 100
+        result = QuizResult(
+            score=final_score,
+            total=total_questions,
+            percentage=percentage
+        )
+        db.session.add(result)
+        db.session.commit()
+
+    return jsonify({
+        "correct": correct,
+        "correct_answer": question['correct'],
+        "explanation": question['explanation']
+    })
+
+# ── PORT SCANNER ───────────────────────────────────────────
+
+import socket
+import concurrent.futures
+
+COMMON_PORTS = [
+    {"port": 21,   "service": "FTP",        "risk": "Medium", "description": "File Transfer Protocol. If open and not needed, close it — attackers use it to upload malicious files."},
+    {"port": 22,   "service": "SSH",         "risk": "Low",    "description": "Secure Shell. Used for remote server access. Make sure it uses strong passwords or key-based authentication."},
+    {"port": 23,   "service": "Telnet",      "risk": "High",   "description": "Very old and insecure remote access protocol. Should NEVER be open — all data is sent unencrypted."},
+    {"port": 25,   "service": "SMTP",        "risk": "Medium", "description": "Email sending protocol. If open on a personal device, it could be used to send spam."},
+    {"port": 53,   "service": "DNS",         "risk": "Low",    "description": "Domain Name System. Translates domain names to IP addresses. Usually safe but can be exploited."},
+    {"port": 80,   "service": "HTTP",        "risk": "Low",    "description": "Standard web traffic. Open on web servers. Prefer HTTPS (443) for secure browsing."},
+    {"port": 110,  "service": "POP3",        "risk": "Medium", "description": "Email receiving protocol. Older and less secure than IMAP."},
+    {"port": 135,  "service": "RPC",         "risk": "High",   "description": "Windows Remote Procedure Call. Commonly exploited by malware and ransomware."},
+    {"port": 139,  "service": "NetBIOS",     "risk": "High",   "description": "Windows file sharing. Often exploited on local networks. Close if not needed."},
+    {"port": 143,  "service": "IMAP",        "risk": "Medium", "description": "Email protocol for receiving messages. Should use encrypted version (993)."},
+    {"port": 443,  "service": "HTTPS",       "risk": "Low",    "description": "Secure web traffic. This is the safe version of HTTP — good to see this open on web servers."},
+    {"port": 445,  "service": "SMB",         "risk": "High",   "description": "Windows file sharing. Exploited by famous attacks like WannaCry ransomware. Close if not needed."},
+    {"port": 3306, "service": "MySQL",       "risk": "High",   "description": "MySQL database. Should NEVER be exposed to the internet — keep it local only."},
+    {"port": 3389, "service": "RDP",         "risk": "High",   "description": "Windows Remote Desktop. A top target for hackers. Should be closed or restricted if not in use."},
+    {"port": 5432, "service": "PostgreSQL",  "risk": "High",   "description": "PostgreSQL database port. Like MySQL, should never be publicly accessible."},
+    {"port": 8080, "service": "HTTP-Alt",    "risk": "Medium", "description": "Alternative HTTP port often used by web apps and proxies. Check what is running here."},
+    {"port": 8443, "service": "HTTPS-Alt",   "risk": "Low",    "description": "Alternative HTTPS port. Usually safe but verify what service is using it."},
+    {"port": 27017,"service": "MongoDB",     "risk": "High",   "description": "MongoDB database. Many data breaches happen because this port is left open to the internet."},
+]
+
+def scan_port(host, port, timeout=1):
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return port, result == 0
+    except Exception:
+        return port, False
+
+def resolve_host(target):
+    try:
+        ip = socket.gethostbyname(target)
+        return ip, None
+    except socket.gaierror:
+        return None, "Could not resolve host. Please check the address and try again."
+
+@app.route('/api/scan-ports', methods=['POST'])
+def port_scan():
+    data = request.get_json()
+    target = data.get('target', '').strip()
+
+    if not target:
+        return jsonify({"error": "No target provided"}), 400
+
+    # Security: only allow localhost and private IP ranges
+    # This ensures the tool is used for self-education only
+    allowed_targets = [
+        'localhost', '127.0.0.1',
+    ]
+
+    # Resolve hostname to IP
+    ip, error = resolve_host(target)
+    if error:
+        return jsonify({"error": error}), 400
+
+    # Check if it's a private/local IP for safety
+    import ipaddress
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        is_private = (
+            ip_obj.is_private or
+            ip_obj.is_loopback or
+            target in allowed_targets
+        )
+        if not is_private:
+            return jsonify({
+                "error": "For ethical and legal reasons, this tool only scans localhost and private network addresses. Enter '127.0.0.1' or 'localhost' to scan your own machine."
+            }), 403
+    except ValueError:
+        return jsonify({"error": "Invalid IP address"}), 400
+
+    # Scan ports concurrently for speed
+    open_ports = []
+    closed_ports = []
+
+    ports_to_scan = [p["port"] for p in COMMON_PORTS]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        futures = {executor.submit(scan_port, ip, port): port for port in ports_to_scan}
+        for future in concurrent.futures.as_completed(futures):
+            port, is_open = future.result()
+            port_info = next((p for p in COMMON_PORTS if p["port"] == port), None)
+            if port_info:
+                entry = {**port_info, "open": is_open}
+                if is_open:
+                    open_ports.append(entry)
+                else:
+                    closed_ports.append(entry)
+
+    # Sort by port number
+    open_ports.sort(key=lambda x: x["port"])
+    closed_ports.sort(key=lambda x: x["port"])
+
+    # Risk summary
+    high_risk_open = [p for p in open_ports if p["risk"] == "High"]
+    medium_risk_open = [p for p in open_ports if p["risk"] == "Medium"]
+
+    if high_risk_open:
+        overall = "Danger"
+        overall_color = "#e74c3c"
+        advice = f"{len(high_risk_open)} high-risk port(s) are open. Review and close them immediately."
+    elif medium_risk_open:
+        overall = "Caution"
+        overall_color = "#f39c12"
+        advice = f"{len(medium_risk_open)} medium-risk port(s) are open. Review whether they are needed."
+    elif open_ports:
+        overall = "Good"
+        overall_color = "#2ecc71"
+        advice = "Only low-risk ports are open. Your network exposure looks reasonable."
+    else:
+        overall = "Excellent"
+        overall_color = "#2ecc71"
+        advice = "No common ports are open. Your machine is well secured."
+
+    return jsonify({
+        "target": target,
+        "ip": ip,
+        "open_ports": open_ports,
+        "closed_ports": closed_ports,
+        "total_open": len(open_ports),
+        "overall": overall,
+        "overall_color": overall_color,
+        "advice": advice,
+        "high_risk_count": len(high_risk_open),
+    })
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    total_passwords = PasswordCheck.query.count()
+    total_phishing = PhishingCheck.query.count()
+    total_quizzes = QuizResult.query.count()
+
+    # Password strength breakdown
+    strong = PasswordCheck.query.filter_by(strength="Strong").count()
+    good = PasswordCheck.query.filter_by(strength="Good").count()
+    fair = PasswordCheck.query.filter_by(strength="Fair").count()
+    weak = PasswordCheck.query.filter_by(strength="Weak").count()
+    very_weak = PasswordCheck.query.filter_by(strength="Very Weak").count()
+
+    # Phishing verdicts breakdown
+    dangerous = PhishingCheck.query.filter_by(verdict="Dangerous").count()
+    likely_phishing = PhishingCheck.query.filter_by(verdict="Likely Phishing").count()
+    suspicious = PhishingCheck.query.filter_by(verdict="Suspicious").count()
+    safe = PhishingCheck.query.filter_by(verdict="Likely Safe").count()
+
+    # Quiz average score
+    all_quizzes = QuizResult.query.all()
+    avg_score = round(sum(q.percentage for q in all_quizzes) / len(all_quizzes), 1) if all_quizzes else 0
+
+    # Recent activity
+    recent_passwords = [p.to_dict() for p in PasswordCheck.query.order_by(PasswordCheck.date_checked.desc()).limit(5).all()]
+    recent_phishing = [p.to_dict() for p in PhishingCheck.query.order_by(PhishingCheck.date_checked.desc()).limit(5).all()]
+    recent_quizzes = [q.to_dict() for q in QuizResult.query.order_by(QuizResult.date_taken.desc()).limit(5).all()]
+
+    return jsonify({
+        "totals": {
+            "passwords_checked": total_passwords,
+            "phishing_checked": total_phishing,
+            "quizzes_taken": total_quizzes,
+        },
+        "password_breakdown": {
+            "Strong": strong, "Good": good, "Fair": fair,
+            "Weak": weak, "Very Weak": very_weak
+        },
+        "phishing_breakdown": {
+            "Dangerous": dangerous, "Likely Phishing": likely_phishing,
+            "Suspicious": suspicious, "Likely Safe": safe
+        },
+        "quiz_average": avg_score,
+        "recent": {
+            "passwords": recent_passwords,
+            "phishing": recent_phishing,
+            "quizzes": recent_quizzes
+        }
+    })
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
