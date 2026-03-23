@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import axios from "axios";
 
-const API = "http://localhost:5000";
+const API = "https://uganda-cybershield-api.onrender.com";
 
 // ── PASSWORD CHECKER ─────────────────────────────────────────
 function PasswordChecker() {
